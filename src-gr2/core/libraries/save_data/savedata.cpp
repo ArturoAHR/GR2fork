@@ -323,6 +323,7 @@ static std::array<std::optional<SaveInstance>, 16> g_mount_slots;
 // completing the item rather than by the server withdrawing it. The live server is the authority
 // on what a player currently has, so clear the served set at mount time and let the session
 // repopulate it: this is the targeted form of wiping the save, which is what restores the cards.
+// News/dlc sits in the same tree but is local DLC-announcement state, so it is kept.
 //
 // The file is a ggdL tree: a 16-byte header ("ggdL", hash, size, entry count) then `count` 16-byte
 // entries {u32 name_off; u32 packed; u32 n; u32 fnv}, where packed is (value_off << 4) | type, and
@@ -429,14 +430,30 @@ void Gr2ClearServedNewsSlots(const fs::path& save_dir) {
         return;
     }
 
+    // News/dlc is not served: it holds the game's own {time, state} record of which add-on
+    // costumes and items it has already announced. Clearing it re-announces every installed DLC on
+    // each boot, so its run is walked with the same child counting but left untouched.
     u32 cleared = 0;
     std::size_t outstanding = 1;
+    std::size_t kept = 0;
     for (std::size_t i = news; i < count && outstanding > 0; ++i) {
         u32 name_off = 0, value_off = 0, type = 0, n = 0;
         entry_at(i, name_off, value_off, type, n);
         --outstanding;
+        const bool in_kept = kept > 0;
+        if (in_kept) {
+            --kept;
+        }
         if (type == kGgdlTypeObject) {
             outstanding += n;
+            if (in_kept) {
+                kept += n;
+            } else if (name_of(name_off) == "dlc") {
+                kept = n;
+            }
+            continue;
+        }
+        if (in_kept) {
             continue;
         }
         if (type == kGgdlTypeScalar) {

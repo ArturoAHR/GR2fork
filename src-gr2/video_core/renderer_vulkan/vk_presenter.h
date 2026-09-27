@@ -97,27 +97,27 @@ public:
     /// because Stop() lands while the GPU still has in-flight draws sampling
     /// the decoded NV12 frame.
     ///
-    /// GR2FORK: the Khronos validation layer flags this as
-    /// UNASSIGNED-Threading-MultipleThreads-Write because vkDeviceWaitIdle
-    /// is equivalent to vkQueueWaitIdle on every queue (Vulkan spec 3.6.3) and
-    /// AvPlayerSource::Stop runs on a guest thread that doesn't hold
-    /// Scheduler::submit_mutex. Both race-free alternatives regress
-    /// performance:
-    ///   - wrapping waitIdle in Scheduler::submit_mutex holds the lock for
-    ///       the full drain, stalling the renderer at every AvPlayer Stop.
-    ///       GR2 cycles Stop rapidly during comic panels, producing
-    ///       visible per-transition stutter.
-    ///   - snapshotting scheduler ticks under a brief lock, then waiting via
-    ///       timeline semaphores (vkWaitSemaphores - device op, not queue
-    ///       op) eliminates per-transition stutter but degrades overall
-    ///       steady-state performance, likely because Stop() fires often
-    ///       enough that the per-call drain cost accumulates.
-    /// On RADV/Mesa with the Z1 Extreme this race does not produce real
-    /// driver corruption (no DEVICE_LOST observed across thousands of
-    /// validation-on intents). Accept the per-spec race in exchange for
-    /// the perf baseline.
+    /// GR2FORK FIX: vkDeviceWaitIdle is a queue operation on every queue (Vulkan spec 3.6.3)
+    /// and AvPlayerSource::Stop runs on guest threads that don't hold Scheduler::submit_mutex,
+    /// so it raced vkQueueSubmit/vkQueuePresentKHR on the shared graphics queue
+    /// (UNASSIGNED-Threading-MultipleThreads-Write). Harmless on RADV, but on NVIDIA it
+    /// corrupts the push buffer (Xid 32 / Xid 13) and loses the device. It also made the guest
+    /// wait on presentation: a present submit stuck on its swapchain acquire kept the device
+    /// busy forever and hung GAME_MainThread inside sceAvPlayerStop.
+    /// Only draw_scheduler's timeline (shared by compute_scheduler) runs work that reads guest
+    /// memory - texture uploads and the video-out copy in DoPrepareFrameRecord; present and
+    /// flip work only touch presenter-owned frame/swapchain images. So snapshot the last
+    /// submitted draw tick under submit_mutex (each submit allocates its tick and submits
+    /// inside that lock, so every tick below CurrentTick() is on the queue) and wait on the
+    /// timeline outside the lock: no queue access, the renderer is never blocked for the
+    /// drain, and a presentation stall can no longer freeze the guest from here.
     void WaitIdle() {
-        (void)instance.GetDevice().waitIdle();
+        u64 draw_tick{};
+        {
+            std::scoped_lock lk{Scheduler::submit_mutex};
+            draw_tick = draw_scheduler.CurrentTick() - 1;
+        }
+        draw_scheduler.GetMasterSemaphore()->Wait(draw_tick);
     }
 
     Frame* PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,

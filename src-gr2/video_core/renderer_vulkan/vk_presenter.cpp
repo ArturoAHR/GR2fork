@@ -744,13 +744,21 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
         }
     };
 
+    // GR2FORK FIX: Swapchain::Recreate drains with vkDeviceWaitIdle, a queue operation on the
+    // graphics queue the assembler submits to; hold submit_mutex like the post-present
+    // Recreate below does, or the drain races vkQueueSubmit (push-buffer corruption on NVIDIA).
+    const auto recreate_swapchain = [&] {
+        std::scoped_lock lk{Scheduler::submit_mutex};
+        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+    };
+
     // Recreate the swapchain if the window was resized.
     if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
-        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        recreate_swapchain();
     }
 
     if (!swapchain.AcquireNextImage()) {
-        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        recreate_swapchain();
         if (!swapchain.AcquireNextImage()) {
             // User resizes the window too fast and GPU can't keep up. Skip this frame.
             LOG_WARNING(Render_Vulkan, "Skipping frame!");

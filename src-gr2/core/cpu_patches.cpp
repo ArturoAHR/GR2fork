@@ -803,7 +803,7 @@ static void TryPatchAot(void* code_address, u64 code_size) {
     }
 }
 
-#if defined(_WIN32)
+#if defined(ARCH_X86_64) && !defined(__APPLE__)
 
 /// Returns true for SSE4a mnemonics that are safe to AOT-patch regardless of
 /// TLS / FS-segment state. EXTRQ/INSERTQ/MOVNTSS/MOVNTSD generators emit pure
@@ -896,6 +896,13 @@ static std::pair<bool, u64> TryRelocate4ByteSse4aRr(
     }
     if (UsesRipRelative(next_inst, next_operands)) {
         g_aot_sse4a_stats.rr_skipped_next_rip_rel.fetch_add(1, std::memory_order_relaxed);
+        return std::make_pair(false, inst.length);
+    }
+    // An FS/GS-relative neighbour must stay in place: on Linux, TryPatchAot rewrites those
+    // accesses at their original address after this pass, and a verbatim copy in the
+    // trampoline would escape that rewrite.
+    if (next_inst.attributes & (ZYDIS_ATTRIB_HAS_SEGMENT_FS | ZYDIS_ATTRIB_HAS_SEGMENT_GS)) {
+        g_aot_sse4a_stats.rr_skipped_other.fetch_add(1, std::memory_order_relaxed);
         return std::make_pair(false, inst.length);
     }
 
@@ -1161,6 +1168,13 @@ void PrePatchInstructions(u64 segment_addr, u64 segment_size) {
     // Linux and others have an FS segment pointing to valid memory, so continue to do full
     // ahead-of-time patching for now until a better solution is worked out.
     if (!Patches.empty()) {
+#if defined(ARCH_X86_64)
+        // Relocate the 4-byte EXTRQ/INSERTQ register forms first, while their neighbouring
+        // instructions are still original bytes. TryPatchAot turns SSE4a neighbours into JMPs,
+        // which the relocator refuses to move, and the rr forms would otherwise trap and be
+        // interpreted in the SIGILL handler on every execution (~1.5M/s in GR2 on Intel).
+        TryPatchAotSSE4aOnly(reinterpret_cast<void*>(segment_addr), segment_size);
+#endif
         TryPatchAot(reinterpret_cast<void*>(segment_addr), segment_size);
     }
 #elif defined(_WIN32) && defined(ARCH_X86_64)
